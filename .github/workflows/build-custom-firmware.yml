@@ -161,9 +161,12 @@ jobs:
                   sha256sums)
                     # We will regenerate sha256sums file for all files in release-files/ later
                     ;;
-                  *)
-                    # Copy all other files (images, manifests, etc.) directly
+                  *.manifest|*.bin|*.ubi|*.itb|*.img)
+                    # Copy manifest and image files directly
                     cp "$filepath" "release-files/$filename"
+                    ;;
+                  *)
+                    # Ignore packages, package indexes, and other internal metadata
                     ;;
                 esac
               done
