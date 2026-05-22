@@ -136,14 +136,61 @@ jobs:
       - name: Organize Release Files
         run: |
           mkdir -p release-files
-          # Find all .bin files under artifacts/ and copy to release-files/
-          find artifacts/ -name "*.bin" -exec cp {} release-files/ \;
+
+          # Loop through each artifact directory
+          for art_dir in artifacts/firmware-*; do
+            if [ -d "$art_dir" ]; then
+              # Extract config name from folder name (firmware-<config>)
+              config_name=$(basename "$art_dir" | sed 's/^firmware-//')
+              echo "Processing artifact directory for config: $config_name"
+              
+              # Find all files inside this artifact directory recursively
+              find "$art_dir" -type f | while read -r filepath; do
+                filename=$(basename "$filepath")
+                
+                case "$filename" in
+                  config.buildinfo)
+                    cp "$filepath" "release-files/${config_name}.config.buildinfo"
+                    ;;
+                  feeds.buildinfo)
+                    cp "$filepath" "release-files/${config_name}.feeds.buildinfo"
+                    ;;
+                  version.buildinfo)
+                    cp "$filepath" "release-files/${config_name}.version.buildinfo"
+                    ;;
+                  sha256sums)
+                    # We will regenerate sha256sums file for all files in release-files/ later
+                    ;;
+                  *)
+                    # Copy all other files (images, manifests, etc.) directly
+                    cp "$filepath" "release-files/$filename"
+                    ;;
+                esac
+              done
+            fi
+          done
+
+          # Generate the unified sha256sums file in release-files
+          cd release-files
+          rm -f sha256sums
+          find . -type f | sed 's|^\./||' | sort | while read -r f; do
+            sha256sum -b "$f" >> sha256sums
+          done
+          cd ..
+
           echo "Files to release:"
           ls -la release-files/
 
       - name: Create Draft Release
         uses: softprops/action-gh-release@v3
         with:
+          name: OpenWrt master build (v26) - ${{ github.ref_name }}
+          body: |
+            Highlights:
+            • Synced with latest upstream/main merge state in this repo.
+            • Rebuilt custom OpenWrt images for Xiaomi Redmi AX3000 and Xiaomi CR881x.
+
+            Assets follow the standard bundle format and include both device artifacts.
           files: release-files/*
           draft: true
           prerelease: false
