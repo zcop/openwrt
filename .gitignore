@@ -35,3 +35,15 @@ git-src
 .cproject
 .ccache
 .vscode*
+
+# Local tool caches and metadata
+.antigravitycli/
+.codex
+.config.bak
+
+# Custom build logs and diagnostics
+/job_err.txt
+/job_log.txt
+/logs_download/
+/logs_qualcommax/
+
