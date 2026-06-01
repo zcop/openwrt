@@ -1,6 +1,6 @@
---- a/mount_root.c	2026-03-28 01:23:19.567460875 +0700
-+++ b/mount_root.c	2026-03-28 01:49:41.521438985 +0700
-@@ -15,14 +15,262 @@
+--- a/mount_root.c
++++ b/mount_root.c
+@@ -15,8 +15,13 @@
  #include <sys/types.h>
  #include <sys/stat.h>
  #include <unistd.h>
@@ -14,9 +14,10 @@
  
  #include <libubox/ulog.h>
  
- #include "libfstools/libfstools.h"
- #include "libfstools/volume.h"
+@@ -25,6 +30,254 @@
+ #include "libfstools/common.h"
  
+ #define BUFLEN 64
 +#define DT_COMPATIBLE_PATH      "/proc/device-tree/compatible"
 +#define PROC_MTD_PATH           "/proc/mtd"
 +#define SYS_UBI_PATH            "/sys/class/ubi"
@@ -218,7 +219,7 @@
 +
 +static void overlay_volume_fixup(struct volume *v)
 +{
-+	if (!v || !v->name || strcmp(v->name, "userdata"))
++	if (!v)
 +		return;
 +
 +	if (cr881x_userdata_ubi < 0 || !cr881x_userdata_mount_src[0])
@@ -228,7 +229,7 @@
 +	v->blk = strdup(cr881x_userdata_mount_src);
 +}
 +
-+static struct volume *overlay_volume_find_start(void)
++static struct volume *overlay_volume_find_start(char *default_name)
 +{
 +	const char *name;
 +	struct volume *v;
@@ -236,15 +237,17 @@
 +	if (cr881x_userdata_prepared < 0)
 +		cr881x_userdata_prepared = ensure_cr881x_userdata();
 +
-+	name = (cr881x_userdata_prepared == 0) ? "userdata" : "rootfs_data";
++	name = (cr881x_userdata_prepared == 0) ? "userdata" : default_name;
 +	v = volume_find((char *)name);
 +	if (!v && strcmp(name, "rootfs_data"))
 +		v = volume_find("rootfs_data");
++	if (cr881x_userdata_prepared == 0)
++		overlay_volume_fixup(v);
 +
 +	return v;
 +}
 +
-+static struct volume *overlay_volume_find_done(void)
++static struct volume *overlay_volume_find_done(char *default_name)
 +{
 +	struct volume *v;
 +
@@ -253,26 +256,29 @@
 +
 +	if (cr881x_userdata_prepared == 0) {
 +		v = volume_find("userdata");
-+		if (v)
++		if (!v)
++			v = volume_find(default_name);
++		if (v) {
++			overlay_volume_fixup(v);
 +			return v;
++		}
 +	}
 +
-+	return volume_find("rootfs_data");
++	return volume_find(default_name);
 +}
-+
+ 
  /*
   * Called in the early (PREINIT) stage, when we immediately need some writable
-  * filesystem.
-@@ -31,7 +276,7 @@
- start(int argc, char *argv[3])
- {
- 	struct volume *root;
--	struct volume *data = volume_find("rootfs_data");
-+	struct volume *data = overlay_volume_find_start();
- 	struct stat s;
+@@ -42,7 +295,7 @@
+ 	if (get_var_from_file("/proc/cmdline", "fstools_overlay_name", dataparam, sizeof(dataparam)))
+ 		dataname = dataparam;
+ 
+-	data = volume_find(dataname);
++	data = overlay_volume_find_start(dataname);
  
  	if (!getenv("PREINIT") && stat("/tmp/.preinit", &s))
-@@ -59,8 +304,9 @@
+ 		return -1;
+@@ -69,8 +322,9 @@
  		return 0;
  	}
  
@@ -283,12 +289,12 @@
  	switch (volume_identify(data)) {
  	case FS_NONE:
  		ULOG_WARN("no usable overlay filesystem found, using tmpfs overlay\n");
-@@ -105,7 +351,7 @@
+@@ -115,7 +369,7 @@
  static int
  done(int argc, char *argv[1])
  {
 -	struct volume *v = volume_find("rootfs_data");
-+	struct volume *v = overlay_volume_find_done();
++	struct volume *v = overlay_volume_find_done("rootfs_data");
  
  	if (!v)
  		return -1;
