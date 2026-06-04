@@ -257,6 +257,41 @@ yt921x_dsa_port_lag_join(struct dsa_switch *ds, int port, struct dsa_lag lag,
 	return res;
 }
 
+static int yt921x_fdb_recover_soft_locked(struct yt921x_priv *priv)
+{
+	struct device *dev = yt921x_dev(priv);
+	u32 val;
+	int res;
+
+	res = yt921x_reg_write(priv, YT921X_FDB_OP, 0);
+	if (res)
+		return res;
+
+	val = YT921X_FDB_RESULT_DONE;
+	res = yt921x_reg_wait(priv, YT921X_FDB_RESULT, YT921X_FDB_RESULT_DONE,
+			      &val);
+	if (res) {
+		dev_warn(dev, "FDB soft recovery: command latch clear timeout: %d\n",
+			 res);
+		return res;
+	}
+
+	return 0;
+}
+
+static int yt921x_fdb_recover_locked(struct yt921x_priv *priv)
+{
+	struct device *dev = yt921x_dev(priv);
+	int res;
+
+	res = yt921x_fdb_recover_soft_locked(priv);
+	if (res)
+		return res;
+
+	dev_warn(dev, "FDB soft recovery complete (latch cleared, no flush)\n");
+	return 0;
+}
+
 static int yt921x_fdb_wait(struct yt921x_priv *priv, u32 *valp)
 {
 	struct device *dev = yt921x_dev(priv);
@@ -266,7 +301,12 @@ static int yt921x_fdb_wait(struct yt921x_priv *priv, u32 *valp)
 	res = yt921x_reg_wait(priv, YT921X_FDB_RESULT, YT921X_FDB_RESULT_DONE,
 			      &val);
 	if (res) {
+		int recover_res;
+
 		dev_err(dev, "FDB probably stuck\n");
+		recover_res = yt921x_fdb_recover_locked(priv);
+		if (recover_res)
+			dev_err(dev, "FDB recovery failed: %d\n", recover_res);
 		return res;
 	}
 

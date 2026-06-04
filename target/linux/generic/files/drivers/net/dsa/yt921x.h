@@ -563,7 +563,7 @@ struct yt921x_priv;
 #define   YT921X_ACL_ACTc_STAG_TAG			YT921X_ACL_ACTc_STAG(2)
 #define   YT921X_ACL_ACTc_STAG_KEEP			YT921X_ACL_ACTc_STAG(3)
 #define  YT921X_ACL_ACTc_CTAG_M			GENMASK(24, 23)
-#define   YT921X_ACL_ACTc_CTAG(x)			FIELD_PREP(YT921X_ACL_ACTc_STAG_M, (x))
+#define   YT921X_ACL_ACTc_CTAG(x)			FIELD_PREP(YT921X_ACL_ACTc_CTAG_M, (x))
 #define   YT921X_ACL_ACTc_CTAG_DONTCARE			YT921X_ACL_ACTc_CTAG(0)
 #define   YT921X_ACL_ACTc_CTAG_UNTAG			YT921X_ACL_ACTc_CTAG(1)
 #define   YT921X_ACL_ACTc_CTAG_TAG			YT921X_ACL_ACTc_CTAG(2)
@@ -1302,6 +1302,9 @@ enum yt921x_vlan_fid_mode {
 	YT921X_VLAN_FID_MODE_IVL = 0,
 	YT921X_VLAN_FID_MODE_SVL = 1,
 };
+
+#define YT921X_CONDUIT_ROLE_PRIMARY	"primary-conduit"
+#define YT921X_CONDUIT_ROLE_SECONDARY	"secondary-conduit"
 
 struct yt921x_priv {
 	struct dsa_switch ds;

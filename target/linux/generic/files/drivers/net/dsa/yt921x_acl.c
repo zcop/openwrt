@@ -128,7 +128,10 @@ yt921x_acl_meter_apply(struct yt921x_priv *priv, int port, u32 meter_id,
 			       YT921X_METER_RATE_MAX, YT921X_METER_BURST_MAX,
 			       YT921X_METER_UNIT_MAX, &meter);
 	if (res) {
-		NL_SET_ERR_MSG_MOD(extack, "Unexpected tremendous rate");
+		if (res == -EINVAL)
+			NL_SET_ERR_MSG_MOD(extack, "Invalid meter time slot configuration");
+		else
+			NL_SET_ERR_MSG_MOD(extack, "Unexpected tremendous rate");
 		return res;
 	}
 
@@ -1187,6 +1190,7 @@ static int
 yt921x_acl_del(struct yt921x_priv *priv, unsigned long cookie,
 	       bool *mirror_enp, u8 *mirror_to_portp)
 {
+	struct yt921x_acl_entry backup[YT921X_ACL_ENT_PER_BLK] = {};
 	struct yt921x_acl_entry *entries;
 	unsigned int offset;
 	unsigned int blkid;
@@ -1228,6 +1232,7 @@ yt921x_acl_del(struct yt921x_priv *priv, unsigned long cookie,
 				priv->udfs_refcnt[udf]--;
 		}
 
+		backup[i] = entries[i];
 		entries[i] = (typeof(*entries)){};
 		ents_mask |= BIT(i);
 	}
@@ -1235,16 +1240,31 @@ yt921x_acl_del(struct yt921x_priv *priv, unsigned long cookie,
 	priv->acl.useds[blkid] -= hweight8(ents_mask);
 
 	res = yt921x_acl_commit(priv, blkid, ents_mask, BIT(offset));
-	if (res)
+	if (res) {
+		unsigned long mask = ents_mask;
+		unsigned long i;
+
+		for_each_set_bit(i, &mask, YT921X_ACL_ENT_PER_BLK) {
+			entries[i] = backup[i];
+			u32 type = FIELD_GET(YT921X_ACL_KEYb_TYPE_M, entries[i].key[1]);
+			if (type >= YT921X_ACL_TYPE_UDF0 && type <= YT921X_ACL_TYPE_UDF7) {
+				unsigned int udf = type - YT921X_ACL_TYPE_UDF0;
+				priv->udfs_refcnt[udf]++;
+			}
+		}
+		priv->acl.useds[blkid] += hweight8(ents_mask);
 		return res;
+	}
 
 	if (meter_en && meter_id != YT921X_ACL_METER_ID_INVALID &&
 	    meter_id != YT921X_ACL_METER_ID_BLACKHOLE) {
-		res = yt921x_acl_meter_clear_hw(priv, meter_id);
-		if (res)
-			return res;
+		int clear_res = yt921x_acl_meter_clear_hw(priv, meter_id);
 
 		yt921x_acl_meter_free(priv, meter_id);
+		if (clear_res)
+			YT921X_RECORD_ERR(priv, acl_commit_errors,
+					  YT921X_TELEM_STAGE_ACL_COMMIT,
+					  clear_res, -1, meter_id, 0, cookie);
 	}
 
 	return 0;
@@ -1355,8 +1375,16 @@ yt921x_acl_add(struct yt921x_priv *priv, const struct yt921x_acl_entry *group,
 	WARN_ON(priv->acl.useds[blkid] > YT921X_ACL_ENT_PER_BLK);
 
 	res = yt921x_acl_commit(priv, blkid, ents_mask, BIT(offset));
-	if (res)
+	if (res) {
+		unsigned long mask = ents_mask;
+		unsigned long i;
+
+		for_each_set_bit(i, &mask, YT921X_ACL_ENT_PER_BLK)
+			entries[i] = (typeof(*entries)){};
+
+		priv->acl.useds[blkid] -= hweight8(ents_mask);
 		return res;
+	}
 
 	for (unsigned int i = 0; i < udfs_cnt; i++) {
 		unsigned int o = udfs_remap[i];
@@ -1438,6 +1466,13 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 		return -EOPNOTSUPP;
 
 	mutex_lock(&priv->reg_lock);
+	if (yt921x_acl_find(priv, cls->cookie) != UINT_MAX) {
+		NL_SET_ERR_MSG_MOD(cls->common.extack,
+				   "filter cookie already exists");
+		res = -EEXIST;
+		goto out_unlock;
+	}
+
 	flow_action_for_each(i, act, &rule->action) {
 		if (act->id != FLOW_ACTION_POLICE)
 			continue;

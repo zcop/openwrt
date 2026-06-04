@@ -189,23 +189,17 @@ yt921x_dsa_port_change_conduit(struct dsa_switch *ds, int port,
 		res = yt921x_secondary_cpu_isolation_sync(priv, new_cpu_port);
 	if (!res && new_cpu_port != old_cpu_port)
 		res = yt921x_secondary_cpu_isolation_sync(priv, old_cpu_port);
-	if (!res) {
+	if (!res)
 		res = yt921x_conduit_fdb_retarget(priv, port, old_cpu_port,
 						  new_cpu_port);
-		if (!res) {
-			res = yt921x_reg_update_bits(priv, YT921X_EXT_CPU_PORT,
-						     YT921X_EXT_CPU_PORT_PORT_M,
-						     YT921X_EXT_CPU_PORT_PORT(new_cpu_port));
-			if (!res) {
-				res = yt921x_reg_read(priv, YT921X_EXT_CPU_PORT, &val);
-				if (!res)
-					dev_dbg(ds->dev,
-						"port%d conduit cpu%d->cpu%d ext_cpu=%lu\n",
-						port, old_cpu_port, new_cpu_port,
-						FIELD_GET(YT921X_EXT_CPU_PORT_PORT_M, val));
-			}
-		}
-	}
+
+	/* Do NOT update YT921X_EXT_CPU_PORT here. That register must stay
+	 * pinned to primary_cpu_port (set once in yt921x_chip_setup_dsa).
+	 * The secondary conduit uses DSA_TAG_PROTO_NONE and receives raw
+	 * untagged frames via port isolation steering alone. Redirecting
+	 * EXT_CPU_PORT to the secondary conduit would break the tagged
+	 * dataplane for every user port still on the primary conduit.
+	 */
 out_unlock:
 	mutex_unlock(&priv->reg_lock);
 
@@ -496,18 +490,6 @@ int yt921x_chip_reset(struct yt921x_priv *priv)
 	return 0;
 }
 
-static __maybe_unused bool yt921x_mdio_phyid_valid(u16 id1, u16 id2)
-{
-	/* 0x1140/0x1140 is a known pseudo responder pattern on non-PHY MBUS
-	 * paths; exclude it from the valid responder mask.
-	 */
-	if (id1 == 0x1140 && id2 == 0x1140)
-		return false;
-
-	return id1 != 0x0000 && id1 != 0xffff &&
-	       id2 != 0x0000 && id2 != 0xffff;
-}
-
 static int yt921x_validate_setup_locked(struct yt921x_priv *priv)
 {
 	struct device *dev = yt921x_dev(priv);
@@ -553,6 +535,18 @@ static int yt921x_validate_setup_locked(struct yt921x_priv *priv)
 }
 
 #if IS_ENABLED(CONFIG_NET_DSA_YT921X_DEBUG)
+static bool yt921x_mdio_phyid_valid(u16 id1, u16 id2)
+{
+	/* 0x1140/0x1140 is a known pseudo responder pattern on non-PHY MBUS
+	 * paths; exclude it from the valid responder mask.
+	 */
+	if (id1 == 0x1140 && id2 == 0x1140)
+		return false;
+
+	return id1 != 0x0000 && id1 != 0xffff &&
+	       id2 != 0x0000 && id2 != 0xffff;
+}
+
 static void yt921x_log_mdio_summary_locked(struct yt921x_priv *priv)
 {
 	struct device *dev = yt921x_dev(priv);
@@ -849,6 +843,90 @@ yt921x_debug_init_checkpoint_locked(struct yt921x_priv *priv,
 }
 #endif
 
+static int yt921x_cpu_conduit_roles_parse(struct yt921x_priv *priv,
+					  int *primary_cpu_port,
+					  int *secondary_cpu_port)
+{
+	struct dsa_switch *ds = &priv->ds;
+	struct device *dev = yt921x_dev(priv);
+	bool invalid = false;
+	bool any = false;
+	int primary = -1;
+	int secondary = -1;
+	int port;
+
+	for (port = 0; port < ds->num_ports; port++) {
+		struct dsa_port *dp;
+		const char *role;
+
+		if (!dsa_is_cpu_port(ds, port))
+			continue;
+
+		dp = dsa_to_port(ds, port);
+		if (!dp || !dp->dn)
+			continue;
+
+		if (of_property_read_string(dp->dn, "motorcomm,conduit-role", &role) &&
+		    of_property_read_string(dp->dn, "conduit-role", &role))
+			continue;
+
+		any = true;
+		if (!strcmp(role, YT921X_CONDUIT_ROLE_PRIMARY)) {
+			if (primary >= 0 && primary != port) {
+				dev_warn(dev,
+					 "Duplicate conduit role '%s' on cpu ports %d and %d, keeping first (%d)\n",
+					 YT921X_CONDUIT_ROLE_PRIMARY, primary, port,
+					 primary);
+				continue;
+			}
+			primary = port;
+			continue;
+		}
+
+		if (!strcmp(role, YT921X_CONDUIT_ROLE_SECONDARY)) {
+			if (secondary >= 0 && secondary != port) {
+				dev_warn(dev,
+					 "Duplicate conduit role '%s' on cpu ports %d and %d, keeping first (%d)\n",
+					 YT921X_CONDUIT_ROLE_SECONDARY, secondary, port,
+					 secondary);
+				continue;
+			}
+			secondary = port;
+			continue;
+		}
+
+		dev_warn(dev,
+			 "Unknown conduit role '%s' on cpu port %d; valid values: '%s' or '%s'\n",
+			 role, port, YT921X_CONDUIT_ROLE_PRIMARY,
+			 YT921X_CONDUIT_ROLE_SECONDARY);
+		invalid = true;
+	}
+
+	if (!any)
+		return 0;
+
+	if (primary < 0) {
+		dev_warn(dev,
+			 "Conduit roles present but no '%s' CPU port defined\n",
+			 YT921X_CONDUIT_ROLE_PRIMARY);
+		return -EINVAL;
+	}
+
+	if (secondary == primary) {
+		dev_warn(dev,
+			 "Conduit role conflict: primary and secondary both map to cpu port %d\n",
+			 primary);
+		return -EINVAL;
+	}
+
+	if (invalid)
+		return -EINVAL;
+
+	*primary_cpu_port = primary;
+	*secondary_cpu_port = secondary;
+	return 1;
+}
+
 static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 {
 	struct dsa_switch *ds = &priv->ds;
@@ -859,6 +937,9 @@ static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 	u32 allowed_mask;
 	u32 blocked_mask;
 	int port;
+	int dt_primary_cpu_port = -1;
+	int dt_secondary_cpu_port = -1;
+	int dt_roles_res;
 	int res;
 #if IS_ENABLED(CONFIG_NET_DSA_YT921X_DEBUG)
 	struct yt921x_init_dbg_snapshot dbg_stage;
@@ -869,6 +950,9 @@ static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 	if (!priv->cpu_ports_mask)
 		return -EINVAL;
 
+	dt_roles_res = yt921x_cpu_conduit_roles_parse(priv, &dt_primary_cpu_port,
+						       &dt_secondary_cpu_port);
+
 	if (priv->cpu_ports_mask & BIT(8))
 		priv->primary_cpu_port = 8;
 	else
@@ -878,6 +962,34 @@ static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 		priv->secondary_cpu_port = __ffs(cpu_ports_mask);
 	else
 		priv->secondary_cpu_port = -1;
+
+	if (dt_roles_res > 0) {
+		priv->primary_cpu_port = dt_primary_cpu_port;
+		if (dt_secondary_cpu_port >= 0) {
+			priv->secondary_cpu_port = dt_secondary_cpu_port;
+		} else if (cpu_ports_mask) {
+			priv->secondary_cpu_port = __ffs(priv->cpu_ports_mask &
+							 ~BIT(priv->primary_cpu_port));
+		} else {
+			priv->secondary_cpu_port = -1;
+		}
+
+		dev_info(dev,
+			 "Using DTS conduit roles: primary=%d secondary=%d\n",
+			 priv->primary_cpu_port, priv->secondary_cpu_port);
+	} else if (dt_roles_res < 0) {
+		dev_warn(dev,
+			 "Invalid DTS conduit role mapping, falling back to legacy cpu-port selection (prefer port 8)\n");
+#if 0
+		/* Enable after all DTS files are migrated to conduit-role.
+		 * Hard-fail instead of legacy fallback on invalid role mapping.
+		 */
+		return dt_roles_res;
+#endif
+	} else {
+		dev_warn(dev,
+			 "No DTS conduit roles found; using legacy cpu-port selection (prefer port 8). Add motorcomm,conduit-role to CPU ports for future compatibility\n");
+	}
 
 	if (hweight16(priv->cpu_ports_mask) > 2)
 		dev_warn(dev,
