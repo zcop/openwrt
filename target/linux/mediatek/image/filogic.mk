@@ -382,6 +382,23 @@ define Device/airpi_ap3000m
 endef
 TARGET_DEVICES += airpi_ap3000m
 
+define Device/airtel_aap4221zy
+  DEVICE_VENDOR := Airtel
+  DEVICE_MODEL := AirFiber AAP4221ZY
+  DEVICE_ALT0_VENDOR := Zyxel
+  DEVICE_ALT0_MODEL := EX3310-T0
+  DEVICE_DTS := mt7981b-airtel-aap4221zy
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_PACKAGES := kmod-ledtrig-network kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 256k
+  PAGESIZE := 4096
+  IMAGE_SIZE := 131072k
+  KERNEL_IN_UBI := 1
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += airtel_aap4221zy
+
 define Device/arcadyan_mozart
   DEVICE_VENDOR := Arcadyan
   DEVICE_MODEL := Mozart
@@ -1837,7 +1854,7 @@ define Device/globitel_bt-r320
   KERNEL := kernel-bin | lzma
   KERNEL_INITRAMFS := kernel-bin | lzma | \
 	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
-  KERNEL_INITRAMFS_SUFFIX := -initramfs-recovery.itb
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
   IMAGES := sysupgrade.itb
   IMAGE_SIZE := $$(shell expr 64 + $$(CONFIG_TARGET_ROOTFS_PARTSIZE))m
   IMAGE/sysupgrade.itb := append-kernel | \
@@ -1875,6 +1892,20 @@ define Device/h3c_magic-nx30-pro
 endef
 TARGET_DEVICES += h3c_magic-nx30-pro
 
+define Device/hiveton_h5000m
+  DEVICE_VENDOR := Hiveton
+  DEVICE_MODEL := H5000M
+  DEVICE_ALT0_VENDOR := Airpi
+  DEVICE_ALT0_MODEL := H5000M
+  DEVICE_DTS := mt7987a-hiveton-h5000m
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_PACKAGES := kmod-hwmon-pwmfan kmod-usb3 mt7987-2p5g-phy-firmware \
+	kmod-mt7996e kmod-mt7992-23-firmware f2fsck mkf2fs
+  KERNEL_LOADADDR := 0x40000000
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += hiveton_h5000m
+
 define Device/huasifei_wh3000
   DEVICE_VENDOR := Huasifei
   DEVICE_MODEL := WH3000
@@ -1910,11 +1941,7 @@ define Device/huasifei_wh3000-pro-nand
   DEVICE_VARIANT := NAND
   DEVICE_DTS := mt7981b-huasifei-wh3000-pro-nand
   DEVICE_DTS_DIR := ../dts
-  UBINIZE_OPTS := -E 5
-  BLOCKSIZE := 128k
-  PAGESIZE := 2048
-  IMAGE_SIZE := 229376k
-  KERNEL_IN_UBI := 1
+  IMAGE_SIZE := 231936k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
   DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware \
 	kmod-usb3 kmod-hwmon-pwmfan
