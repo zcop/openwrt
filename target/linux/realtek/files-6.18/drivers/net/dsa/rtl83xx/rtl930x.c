@@ -345,7 +345,7 @@ static inline int rtl930x_trk_mbr_ctr(int group)
 	return RTL930X_TRK_MBR_CTRL + (group << 2);
 }
 
-static void rtl930x_vlan_tables_read(u32 vlan, struct rtl838x_vlan_info *info)
+static void rtl930x_vlan_tables_read(u32 vlan, struct rtldsa_vlan_info *info)
 {
 	u32 v, w;
 	/* Read VLAN table (1) via register 0 */
@@ -372,7 +372,7 @@ static void rtl930x_vlan_tables_read(u32 vlan, struct rtl838x_vlan_info *info)
 	info->untagged_ports = v >> 3;
 }
 
-static void rtl930x_vlan_set_tagged(u32 vlan, struct rtl838x_vlan_info *info)
+static void rtl930x_vlan_set_tagged(u32 vlan, struct rtldsa_vlan_info *info)
 {
 	u32 v, w;
 	/* Access VLAN table (1) via register 0 */
@@ -508,17 +508,37 @@ static void rtldsa_930x_enable_learning(int port, bool enable)
 		    RTL930X_L2_LRN_PORT_CONSTRT_CTRL + port * 4);
 }
 
-static void rtldsa_930x_enable_flood(int port, bool enable)
+static void rtldsa_930x_l2_port_new_sa_fwd(int port, enum rtldsa_flood_type mode)
 {
-	/* 0: forward
-	 * 1: drop
-	 * 2: trap to local CPU
-	 * 3: copy to local CPU
-	 * 4: trap to master CPU
-	 * 5: copy to master CPU
-	 */
-	sw_w32_mask(GENMASK(2, 0), enable ? 0 : 1,
+	u32 new_sa_fwd_shift = (port % 10) * 3;
+
+	sw_w32_mask(GENMASK(new_sa_fwd_shift + 2, new_sa_fwd_shift),
+		    mode << new_sa_fwd_shift,
+		    rtl930x_l2_port_new_sa_fwd(port));
+}
+
+static void rtldsa_930x_enable_flood(int port, enum rtldsa_flood_type mode)
+{
+	u32 port_mask = BIT(port);
+	u32 val;
+
+	val = (mode == RTLDSA_FLOOD_TYPE_FORWARD) ? port_mask : 0;
+
+	sw_w32_mask(GENMASK(2, 0), mode,
 		    RTL930X_L2_LRN_PORT_CONSTRT_CTRL + port * 4);
+
+	sw_w32_mask(port_mask,
+		    val,
+		    RTL930X_L2_UNKN_UC_FLD_PMSK);
+}
+
+static void rtldsa_930x_enable_bcast_flood(int port, bool enable)
+{
+	u32 port_mask = BIT(port);
+
+	sw_w32_mask(port_mask,
+		    enable ? port_mask : 0,
+		    RTL930X_L2_BC_FLD_PMSK);
 }
 
 static void rtldsa_930x_lag_set_port2group(int group, int port, bool valid)
@@ -2215,7 +2235,6 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.l2_ctrl_1 = RTL930X_L2_AGE_CTRL,
 	.l2_port_aging_out = RTL930X_L2_PORT_AGE_CTRL,
 	.set_ageing_time = rtl930x_set_ageing_time,
-	.smi_poll_ctrl = RTL930X_SMI_POLL_CTRL, /* TODO: Difference to RTL9300_SMI_PRVTE_POLLING_CTRL */
 	.l2_tbl_flush_ctrl = RTL930X_L2_TBL_FLUSH_CTRL,
 	.isr_glb_src = RTL930X_ISR_GLB,
 	.isr_port_link_sts_chg = RTL930X_ISR_PORT_LINK_STS_CHG,
@@ -2236,6 +2255,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.stp_get = rtldsa_930x_stp_get,
 	.stp_set = rtl930x_stp_set,
 	.mac_link_sts = RTL930X_MAC_LINK_STS,
+	.mac_force_mode_mask = RTL930X_FORCE_EN | RTL930X_FORCE_LINK_EN,
 	.mac_force_mode_ctrl = rtl930x_mac_force_mode_ctrl,
 	.mac_port_ctrl = rtl930x_mac_port_ctrl,
 	.l2_port_new_salrn = rtl930x_l2_port_new_salrn,
@@ -2269,7 +2289,9 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.packet_cntr_clear = rtl930x_packet_cntr_clear,
 	.led_init = rtl930x_led_init,
 	.enable_learning = rtldsa_930x_enable_learning,
+	.enable_l2_new_sa_fwd = rtldsa_930x_l2_port_new_sa_fwd,
 	.enable_flood = rtldsa_930x_enable_flood,
+	.enable_bcast_flood = rtldsa_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
 	.qos_init = rtldsa_930x_qos_init,
 	.trk_ctrl = RTL930X_TRK_CTRL,
