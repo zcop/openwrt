@@ -911,7 +911,7 @@ $(eval $(call KernelPackage,dsa-qca8k))
 define KernelPackage/dsa-yt921x
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Motorcomm YT921x switch DSA support
-  DEPENDS:=+kmod-dsa
+  DEPENDS:=+kmod-dsa +kmod-hwmon-core
   KCONFIG:= \
 	CONFIG_NET_DSA_YT921X \
 	CONFIG_NET_DSA_TAG_YT921X
