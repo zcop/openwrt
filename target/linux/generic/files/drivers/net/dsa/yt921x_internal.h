@@ -13,6 +13,7 @@
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/fs.h>
+#include <linux/hwmon.h>
 #include <linux/if_bridge.h>
 #include <linux/if_hsr.h>
 #include <linux/if_vlan.h>
@@ -71,6 +72,13 @@ struct yt921x_meter {
 	u32 cbs;
 	u32 ebs;
 	int unit;
+};
+
+enum yt921x_rma_action {
+	YT921X_RMA_ACT_FORWARD = 0,
+	YT921X_RMA_ACT_TRAP_TO_CPU = 1,
+	YT921X_RMA_ACT_COPY_TO_CPU = 2,
+	YT921X_RMA_ACT_DROP = 3,
 };
 
 static inline void
@@ -206,6 +214,7 @@ void yt921x_phylink_mac_config(struct phylink_config *config, unsigned int mode,
 
 int yt921x_chip_reset(struct yt921x_priv *priv);
 int yt921x_chip_setup(struct yt921x_priv *priv);
+bool yt921x_flow_stats_pkt_mode(void);
 int yt921x_qos_remark_dscp_set(struct yt921x_priv *priv, u8 prio, u8 dp, u8 dscp);
 
 void yt921x_dsa_get_strings(struct dsa_switch *ds, int port, u32 stringset, u8 *data);
@@ -223,7 +232,6 @@ void yt921x_dsa_get_stats64(struct dsa_switch *ds, int port,
 void yt921x_dsa_get_pause_stats(struct dsa_switch *ds, int port,
 				struct ethtool_pause_stats *pause_stats);
 int yt921x_dsa_set_mac_eee(struct dsa_switch *ds, int port, struct ethtool_keee *e);
-int yt921x_dsa_get_mac_eee(struct dsa_switch *ds, int port, struct ethtool_keee *e);
 void yt921x_dsa_get_wol(struct dsa_switch *ds, int port,
 			struct ethtool_wolinfo *w);
 int yt921x_dsa_set_wol(struct dsa_switch *ds, int port,

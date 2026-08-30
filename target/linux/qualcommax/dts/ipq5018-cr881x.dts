@@ -5,7 +5,6 @@
 #include "ipq5018.dtsi"
 #include "ipq5018-ess.dtsi"
 #include "ipq5018-qcn6122.dtsi"
-#include <dt-bindings/net/qcom-ipq-ess.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 
@@ -16,10 +15,10 @@
 	aliases {
 		serial0 = &blsp1_uart1;
 
-		label-mac-device = &dp1;
+		label-mac-device = &gmac0;
 
-		ethernet0 = &dp1;
-		ethernet1 = &dp2;
+		ethernet0 = &gmac0;
+		ethernet1 = &gmac1;
 
 		led-boot = &led_system_blue;
 		led-failsafe = &led_system_red;
@@ -41,6 +40,11 @@
 		regulator-max-microvolt = <1100000>;
 		regulator-always-on;
 	};
+};
+
+/* CR881x has 256 MiB and its bootloader does not fix up this node. */
+&{/memory@40000000} {
+	reg = <0x0 0x40000000 0x0 0x10000000>;
 };
 
 &tlmm {
@@ -148,7 +152,7 @@
 };
 
 &sleep_clk {
-	clock-frequency = <32768>;
+	clock-frequency = <32000>;
 };
 
 &xo_board_clk {
@@ -206,11 +210,11 @@
 						#address-cells = <1>;
 						#size-cells = <1>;
 
-						mac_addr_dp1: macaddr@0 {
+						mac_addr_gmac0: macaddr@0 {
 							reg = <0x0 0x6>;
 						};
 
-						mac_addr_dp2: macaddr@6 {
+						mac_addr_gmac1: macaddr@6 {
 							reg = <0x6 0x6>;
 						};
 					};
@@ -248,23 +252,23 @@
 
 		led_system_blue: led_system_blue {
 			label = "blue:system";
-			gpio = <&tlmm 24 GPIO_ACTIVE_HIGH>;
+			gpios = <&tlmm 24 GPIO_ACTIVE_HIGH>;
 			default-state = "on";
 		};
 
 		led_system_red: led_system_red {
 			label = "red:system";
-			gpio = <&tlmm 25 GPIO_ACTIVE_HIGH>;
+			gpios = <&tlmm 25 GPIO_ACTIVE_HIGH>;
 		};
 
 		led_internet_blue: led_internet_blue {
 			label = "blue:internet";
-			gpio = <&tlmm 26 GPIO_ACTIVE_HIGH>;
+			gpios = <&tlmm 26 GPIO_ACTIVE_HIGH>;
 		};
 
 		led_internet_red: led_internet_red {
 			label = "red:internet";
-			gpio = <&tlmm 27 GPIO_ACTIVE_HIGH>;
+			gpios = <&tlmm 27 GPIO_ACTIVE_HIGH>;
 		};
 	};
 
@@ -291,52 +295,25 @@
 	};
 };
 
-&switch {
+&uniphy0 {
 	status = "okay";
 
-	// Keep both CPU uplinks on 1G SGMII for compatibility/stability.
-	switch_mac_mode = <MAC_MODE_SGMII_CHANNEL0>;
-	switch_mac_mode1 = <MAC_MODE_SGMII_CHANNEL1>;
-	switch_mac_mode2 = <MAC_MODE_DISABLED>;
-
-	// ESS port bitmaps (match MAC0/MAC1 usage in qcom,port_phyinfo)
-	switch_cpu_bmp = <ESS_PORT0>;
-	switch_wan_bmp = <ESS_PORT1>;
-	switch_lan_bmp = <ESS_PORT2>;
-	switch_inner_bmp = <ESS_PORT7>;
-
-	qcom,port_phyinfo {
-		// MAC0 -> GE Phy --- YT9215 Phy4
-		port@1 {
-			port_id = <1>;
-			mdiobus = <&mdio0>;
-			phy_address = <7>;
-			phy_dac = <0x10 0x10>;
-		};
-
-		// MAC1 -> Uniphy --- SGMII --- YT9215 Phy8
-		port@2 {
-			port_id = <2>;
-			forced-speed = <1000>;
-			forced-duplex = <1>;
-		};
-	};
+	assigned-clocks = <&uniphy0 UNIPHY_CLK_REF>;
+	assigned-clock-rates = <UNIPHY_REFCLK_50MHZ>;
 };
 
-&dp1 {
+&gmac0 {
 	status = "okay";
-	phy-mode = "internal";
-	phy-handle = <&ge_phy>;
 
-	nvmem-cells = <&mac_addr_dp1 0>;
+	nvmem-cells = <&mac_addr_gmac0 0>;
 	nvmem-cell-names = "mac-address";
 };
 
-&dp2 {
+&gmac1 {
 	status = "okay";
 	phy-mode = "sgmii";
 
-	nvmem-cells = <&mac_addr_dp2 0>;
+	nvmem-cells = <&mac_addr_gmac1 0>;
 	nvmem-cell-names = "mac-address";
 
 	fixed-link {
@@ -362,21 +339,22 @@
 	pinctrl-names = "default";
 	status = "okay";
 	reset-gpios = <&tlmm 39 GPIO_ACTIVE_LOW>;
-	reset-assert-us = <10000>; /* 10ms */
-	reset-deassert-us = <50000>; /* 50ms */
+	reset-delay-us = <10000>; /* 10ms */
+	reset-post-delay-us = <50000>; /* 50ms */
 
 	// Motorcomm YT9215
-		ethernet-switch@1d {
-			compatible = "motorcomm,yt9215";
-			reg = <0x1d>;
-			/* YT921x OAM/LLDP control-policy overrides */
-			motorcomm,rma-slow-action = <2>;
-			motorcomm,ctrlpkt-lldp-act = <0x400>;
-			motorcomm,ctrlpkt-lldp-eee-act = <0x400>;
-			/* Constrain secondary conduit (eth0/raw) to WAN only
-			 * at init: permit only user port@3 on CPU port@4.
-			 */
-			motorcomm,secondary-conduit-user-mask = <0x8>;
+	ethernet-switch@1d {
+		compatible = "motorcomm,yt9215";
+		reg = <0x1d>;
+		/* YT921x OAM/LLDP control-policy overrides */
+		motorcomm,rma-slow-action = <2>;
+		motorcomm,ctrlpkt-lldp-act = <0x400>;
+		motorcomm,ctrlpkt-lldp-eee-act = <0x400>;
+		motorcomm,temp-sensor-supported;
+		/* Constrain secondary conduit (eth0/raw) to WAN only
+		 * at init: permit only user port@3 on CPU port@4.
+		 */
+		motorcomm,secondary-conduit-user-mask = <0x8>;
 
 		mdio {
 			#address-cells = <1>;
@@ -453,7 +431,8 @@
 				reg = <4>;
 				label = "cpu";
 				phy-mode = "internal";
-				ethernet = <&dp1>;
+				motorcomm,conduit-role = "secondary-conduit";
+				ethernet = <&gmac0>;
 				fixed-link {
 					speed = <1000>;
 					full-duplex;
@@ -466,7 +445,9 @@
 			port@8 {
 				reg = <8>;
 				phy-mode = "sgmii";
-				ethernet = <&dp2>;
+				motorcomm,serdes-revsgmii;
+				motorcomm,conduit-role = "primary-conduit";
+				ethernet = <&gmac1>;
 				fixed-link {
 					speed = <1000>;
 					full-duplex;
@@ -480,6 +461,8 @@
 };
 
 &q6v5_wcss {
+	status = "okay";
+
 	memory-region = <&q6_region>;
 	firmware-name = "ath11k/IPQ5018/hw1.0/q6_fw.mdt",
 			"ath11k/IPQ5018/hw1.0/m3_fw.mdt",

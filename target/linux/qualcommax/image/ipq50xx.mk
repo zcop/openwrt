@@ -241,10 +241,8 @@ define Device/xiaomi_cr881x
 		-ath11k-firmware-ipq5018 \
 		-dnsmasq-full dnsmasq \
 		kmod-dsa-yt921x \
-		-automount \
 		-kmod-usb3 -kmod-usb-dwc3 -kmod-usb-dwc3-qcom \
-		-kmod-usb-storage -kmod-usb-storage-uas \
-		-ntfs3-mount
+		-kmod-usb-storage -kmod-usb-storage-uas
 endef
 TARGET_DEVICES += xiaomi_cr881x
 

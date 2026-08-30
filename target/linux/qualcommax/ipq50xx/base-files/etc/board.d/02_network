@@ -31,13 +31,26 @@ ipq50xx_setup_interfaces()
 		;;
 	cmcc,pz-l8|\
 	redmi,ax3000|\
-	xiaomi,cr881x|\
 	xiaomi,redmi-ax5400)
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
 		ucidef_set_network_device_conduit "lan1" "eth1"
 		ucidef_set_network_device_conduit "lan2" "eth1"
 		ucidef_set_network_device_conduit "lan3" "eth1"
 		ucidef_set_network_device_conduit "wan" "eth0"
+		;;
+	xiaomi,cr881x)
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+		ucidef_set_network_device_conduit "lan1" "eth1"
+		ucidef_set_network_device_conduit "lan2" "eth1"
+		ucidef_set_network_device_conduit "lan3" "eth1"
+		ucidef_set_network_device_conduit "wan" "eth0"
+
+		json_select network
+		json_select lan
+		json_add_string ipaddr "192.168.2.1"
+		json_add_string netmask "255.255.255.0"
+		json_select ..
+		json_select ..
 		;;
 	esac
 }

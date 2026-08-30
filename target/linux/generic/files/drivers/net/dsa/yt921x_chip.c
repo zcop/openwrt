@@ -21,11 +21,20 @@ static int yt921x_port_setup(struct yt921x_priv *priv, int port)
 	/* Clear prio order (even if DCB is not enabled) to avoid unsolicited
 	 * priorities
 	 */
-	res = yt921x_reg_write(priv, YT921X_PORTn_PRIO_ORD(port), 0);
+	res = yt921x_reg_write(priv, YT921X_PORTn_PRIO_ORD(port), 0x3b5ed1);
 	if (res)
 		return res;
 
 	if (dsa_is_cpu_port(ds, port)) {
+		/* Enable learning on CPU ports so the switch learns the CPU's
+		 * MAC address and forwards local unicast traffic correctly.
+		 */
+		dev_info(yt921x_dev(priv), "Enabling learning on CPU port %d\n", port);
+		res = yt921x_reg_clear_bits(priv, YT921X_PORTn_LEARN(port),
+					    YT921X_PORT_LEARN_DIS);
+		if (res)
+			return res;
+
 		if (yt921x_is_primary_cpu_port(priv, port)) {
 			/* Primary conduit uses the YT921X tag format, so keep
 			 * untagged egress from this CPU port blocked.
@@ -657,21 +666,34 @@ static int yt921x_qos_remark_prio_set(struct yt921x_priv *priv, u8 prio, u8 dp,
 }
 
 static int yt921x_qos_remark_port_enable(struct yt921x_priv *priv, int port,
-					 bool cpri_enable, bool spri_enable)
+					 bool cpri_enable, bool spri_enable,
+					 bool dscp_enable)
 {
-	u32 val = 0;
+	u32 mask, val = 0;
 
 	if (port < 0 || port >= YT921X_PORT_NUM)
 		return -ERANGE;
+
+	mask = YT921X_QOS_REMARK_PORT_CPRI_EN |
+	       YT921X_QOS_REMARK_PORT_SPRI_EN |
+	       YT921X_QOS_REMARK_PORT_DSCP_EN |
+	       YT921X_QOS_REMARK_PORT_CPRI_SEL |
+	       YT921X_QOS_REMARK_PORT_SPRI_SEL;
 
 	if (cpri_enable)
 		val |= YT921X_QOS_REMARK_PORT_CPRI_EN;
 	if (spri_enable)
 		val |= YT921X_QOS_REMARK_PORT_SPRI_EN;
+	if (dscp_enable)
+		val |= YT921X_QOS_REMARK_PORT_DSCP_EN;
+
+	/* Set CPRI/SPRI remark source selectors to standard defaults:
+	 * CPRI_SEL = 0, SPRI_SEL = 1
+	 */
+	val |= YT921X_QOS_REMARK_PORT_SPRI_SEL;
 
 	return yt921x_reg_update_bits(priv, YT921X_QOS_REMARK_PORT_CTRLn(port),
-				      YT921X_QOS_REMARK_PORT_CPRI_EN |
-				      YT921X_QOS_REMARK_PORT_SPRI_EN, val);
+				      mask, val);
 }
 
 #if IS_ENABLED(CONFIG_NET_DSA_YT921X_DEBUG)
@@ -1143,7 +1165,7 @@ static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 	 * keep only internal MCU (port 10) blocked, allow CPU/LAN/WAN delivery.
 	 * 0x7ff blackholes unknown unicast destined for router MAC on this board.
 	 */
-	ctrl = BIT(10);
+	ctrl = BIT(10) | priv->cpu_ports_mask;
 	res = yt921x_reg_write(priv, YT921X_FILTER_UNK_UCAST, ctrl);
 	if (res)
 		return res;
@@ -1153,8 +1175,8 @@ static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 	/* Keep stock-safe defaults for flood filters until semantics are fully
 	 * mapped on YT9215.
 	 */
-	priv->flood_unk_ucast_base_mask = BIT(10);
-	priv->flood_mcast_base_mask = BIT(10);
+	priv->flood_unk_ucast_base_mask = BIT(10) | priv->cpu_ports_mask;
+	priv->flood_mcast_base_mask = BIT(10) | priv->cpu_ports_mask;
 	priv->flood_bcast_base_mask = BIT(10);
 	priv->flood_storm_mask = 0;
 	res = yt921x_apply_flood_filters_locked(priv);
@@ -1398,9 +1420,60 @@ static int __maybe_unused yt921x_chip_setup_qos(struct yt921x_priv *priv)
 		if (!dsa_is_user_port(&priv->ds, port))
 			continue;
 
-		res = yt921x_qos_remark_port_enable(priv, port, true, true);
+		res = yt921x_qos_remark_port_enable(priv, port, true, true, true);
 		if (res)
 			return res;
+	}
+
+	return 0;
+}
+
+static int yt921x_chip_setup_yt9215s_buffers(struct yt921x_priv *priv)
+{
+	int res, i, f;
+
+	if (strcmp(priv->info->name, "YT9215S") != 0)
+		return 0;
+
+	res = yt921x_reg_write(priv, 0x2801D0, 0xC8);
+	if (res)
+		return res;
+
+	for (i = 0; i < 10; i++) {
+		if (i == 4) {
+			res = yt921x_reg_write(priv, 0x281000 + i * 0x8, 0x80402850);
+			if (res)
+				return res;
+			res = yt921x_reg_write(priv, 0x281000 + 0x4 + i * 0x8, 0x26765);
+			if (res)
+				return res;
+		} else {
+			res = yt921x_reg_write(priv, 0x281000 + i * 0x8, 0x80402850);
+			if (res)
+				return res;
+			res = yt921x_reg_write(priv, 0x281000 + 0x4 + i * 0x8, 0x26f1b);
+			if (res)
+				return res;
+		}
+
+		for (f = 0; f < 8; f++) {
+			res = yt921x_reg_write(priv, 0x301000 + i * 0x40 + f * 0x8, 0x40020);
+			if (res)
+				return res;
+			res = yt921x_reg_write(priv, 0x301000 + 0x4 + i * 0x40 + f * 0x8, 0x0);
+			if (res)
+				return res;
+		}
+
+		if (i < 4) {
+			res = yt921x_reg_write(priv, 0x303000 + i * 0x4, 0x78);
+			if (res)
+				return res;
+		} else if (i == 5) {
+			res = yt921x_reg_write(priv, 0x303000 + 0x20, 0x78);
+			if (res)
+				return res;
+		}
 	}
 
 	return 0;
@@ -1429,6 +1502,10 @@ int yt921x_chip_setup(struct yt921x_priv *priv)
 		return res;
 
 	res = yt921x_chip_setup_qos(priv);
+	if (res)
+		return res;
+
+	res = yt921x_chip_setup_yt9215s_buffers(priv);
 	if (res)
 		return res;
 

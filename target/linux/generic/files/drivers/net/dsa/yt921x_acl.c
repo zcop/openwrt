@@ -9,6 +9,10 @@
 #include "yt921x_internal.h"
 
 #define YT921X_ACL_METER_ID_INVALID	U8_MAX
+#define YT921X_ACL_FLOW_STATS_ID_INVALID	U8_MAX
+#define YT921X_ACL_TAG_FMT_UNTAGGED	0
+#define YT921X_ACL_TAG_FMT_PRIO_TAGGED	1
+#define YT921X_ACL_TAG_FMT_TAGGED	2
 
 static int yt921x_acl_meter_alloc(struct yt921x_priv *priv, u32 *meter_idp)
 {
@@ -37,6 +41,43 @@ static int yt921x_acl_meter_clear_hw(struct yt921x_priv *priv, u32 meter_id)
 	u32 ctrls[3] = {};
 
 	return yt921x_reg96_write(priv, YT921X_METERn_CTRL(meter_id), ctrls);
+}
+
+static int
+yt921x_acl_flow_stats_alloc(struct yt921x_priv *priv, u32 *flow_stats_idp)
+{
+	unsigned long flow_stats_id;
+
+	flow_stats_id = find_first_zero_bit(priv->acl_flow_stats_map,
+					     YT921X_FLOWSTAT_NUM);
+	if (flow_stats_id >= (unsigned long)YT921X_FLOWSTAT_NUM)
+		return -ENOSPC;
+
+	__set_bit(flow_stats_id, priv->acl_flow_stats_map);
+	*flow_stats_idp = flow_stats_id;
+
+	return 0;
+}
+
+static void
+yt921x_acl_flow_stats_free(struct yt921x_priv *priv, u32 flow_stats_id)
+{
+	if (flow_stats_id >= YT921X_FLOWSTAT_NUM)
+		return;
+
+	__clear_bit(flow_stats_id, priv->acl_flow_stats_map);
+}
+
+static int
+yt921x_acl_flow_stats_clear_hw(struct yt921x_priv *priv, u8 flow_stats_id)
+{
+	int res;
+
+	res = yt921x_reg_write(priv, YT921X_FLOWSTATn_CTRL(flow_stats_id), 0);
+	if (res)
+		return res;
+
+	return yt921x_reg64_write(priv, YT921X_FLOWSTATn_STAT(flow_stats_id), 0);
 }
 
 static int
@@ -257,24 +298,37 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 	const struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	struct netlink_ext_ack *extack = cls->common.extack;
 	const struct flow_dissector *dissector;
+	struct flow_match_control ctrl_match = {};
 	bool have_basic;
 	bool have_ip;
 	bool have_ipv4;
 	bool have_ipv6;
 	bool have_ports;
 	bool have_ports_range;
+	bool have_vlan;
+	bool have_cvlan;
+	bool have_num_of_vlans;
+	bool have_pppoe;
+	bool have_meta;
 	bool have_eth;
 	bool have_ctrl;
 	bool have_tcp;
+	bool want_tcp_flags = false;
 	bool n_proto_is_ipv4 = false;
 	bool n_proto_is_ipv6 = false;
 	bool want_n_proto = false;
 	bool want_ip_proto = false;
+	u8 num_of_vlans = 0;
+	u16 addr_type = 0;
+	__be16 cls_protocol = cls->common.protocol;
+	__be16 inner_vlan_tpid = 0;
+	bool inner_vlan_tpid_valid = false;
 	__be16 n_proto = 0;
 	__be16 n_proto_mask = 0;
 	u8 ip_proto = 0;
 	u8 ip_proto_mask = 0;
 	struct yt921x_acl_entry *entry;
+	unsigned int too_complex_entries = 0;
 #if IS_ENABLED(CONFIG_NET_DSA_YT921X_DEBUG)
 	u32 chain_mask = READ_ONCE(priv->acl_chain_key_mask);
 #else
@@ -289,9 +343,26 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 	have_ipv6 = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS);
 	have_ports = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS);
 	have_ports_range = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS_RANGE);
+	have_vlan = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN);
+	have_cvlan = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN);
+	have_num_of_vlans = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_NUM_OF_VLANS);
+	have_pppoe = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE);
+	have_meta = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META);
 	have_eth = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS);
 	have_ctrl = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL);
 	have_tcp = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_TCP);
+
+	if (have_ctrl) {
+		flow_rule_match_control(rule, &ctrl_match);
+		addr_type = ctrl_match.key->addr_type;
+	}
+
+	if (have_tcp) {
+		struct flow_match_tcp match;
+
+		flow_rule_match_tcp(rule, &match);
+		want_tcp_flags = !!match.mask->flags;
+	}
 
 	if (dissector->used_keys &
 	    ~(BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
@@ -301,9 +372,16 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 	      BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
 	      BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |
 	      BIT_ULL(FLOW_DISSECTOR_KEY_PORTS_RANGE) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_NUM_OF_VLANS) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_META) |
 	      BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS) |
 	      BIT_ULL(FLOW_DISSECTOR_KEY_TCP))) {
-		NL_SET_ERR_MSG_MOD(extack, "Unsupported keys used");
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "Unsupported keys used: 0x%016llx",
+				       dissector->used_keys);
 		return 0;
 	}
 
@@ -336,23 +414,39 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 		}
 	}
 
+	if (!want_n_proto && cls_protocol && cls_protocol != htons(ETH_P_ALL)) {
+		want_n_proto = true;
+		n_proto = cls_protocol;
+		n_proto_mask = htons(0xffff);
+		n_proto_is_ipv4 = n_proto == htons(ETH_P_IP);
+		n_proto_is_ipv6 = n_proto == htons(ETH_P_IPV6);
+	}
+
 	/* Tiger ACL uses fixed key-template reductions, not a dynamic parser.
 	 * Reject ambiguous key mixes up-front so unsupported shapes never report
 	 * false hardware offload.
 	 */
+	/* cls_flower stores IPv4/IPv6 address masks in a union and may set both
+	 * used_keys bits for an IPv4 or IPv6 rule. Use control.addr_type as the
+	 * authoritative family selector for address matches.
+	 */
+	if (addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+		have_ipv6 = false;
+	else if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS)
+		have_ipv4 = false;
+	else if (have_ipv4 && have_ipv6 && n_proto_is_ipv4)
+		have_ipv6 = false;
+	else if (have_ipv4 && have_ipv6 && n_proto_is_ipv6)
+		have_ipv4 = false;
+
 	if (have_ipv4 && have_ipv6) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "IPv4 and IPv6 address matches cannot be combined");
 		return 0;
 	}
 
-	if (have_ports_range) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "L4 port-range offload is not supported");
-		return 0;
-	}
-
-	if ((have_ipv4 || have_ipv6 || have_ip || have_ports || have_tcp) &&
+	if ((have_ipv4 || have_ipv6 || have_ip || have_ports ||
+	     have_ports_range || want_tcp_flags) &&
 	    !want_n_proto) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "IP/L4 matches require exact protocol ip or ipv6");
@@ -371,14 +465,20 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 		return 0;
 	}
 
-	if (have_ports || have_tcp) {
+	if (have_ports && have_ports_range) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Simultaneous exact and ranged L4 keys are not supported");
+		return 0;
+	}
+
+	if (have_ports || have_ports_range || want_tcp_flags) {
 		if (!want_ip_proto) {
 			NL_SET_ERR_MSG_MOD(extack,
 					   "L4 keys require exact ip_proto");
 			return 0;
 		}
 
-		if (have_tcp && ip_proto != IPPROTO_TCP) {
+		if (want_tcp_flags && ip_proto != IPPROTO_TCP) {
 			NL_SET_ERR_MSG_MOD(extack,
 					   "tcp_flags match requires ip_proto tcp");
 			return 0;
@@ -390,17 +490,136 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 					   "L4 port match supports only TCP/UDP");
 			return 0;
 		}
+	}
 
-		if (n_proto_is_ipv6) {
+	if (have_meta) {
+		struct flow_match_meta match;
+		struct dsa_port *dp;
+		int port;
+
+		flow_rule_match_meta(rule, &match);
+
+		if (match.mask->l2_miss) {
+			NL_SET_ERR_MSG_MOD(extack, "l2_miss match is not supported");
+			return 0;
+		}
+
+		if (match.mask->ingress_iftype) {
 			NL_SET_ERR_MSG_MOD(extack,
-					   "IPv6 L4 ACL template is not supported");
+					   "ingress_iftype match is not supported");
+			return 0;
+		}
+
+		if (!match.mask->ingress_ifindex)
+			goto meta_done;
+
+		if (match.mask->ingress_ifindex != 0xffffffff) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact ingress_ifindex mask is supported");
+			return 0;
+		}
+
+		port = ports_mask ? __ffs(ports_mask) : -1;
+		if (port < 0) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "ingress_ifindex match requires a bound user port");
+			return 0;
+		}
+
+		dp = dsa_to_port(&priv->ds, port);
+		if (!dp || !dp->user) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "ingress_ifindex match requires a user port netdev");
+			return 0;
+		}
+
+		if (match.key->ingress_ifindex != dp->user->ifindex) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "ingress_ifindex must match the bound user port");
+			return 0;
+		}
+	}
+meta_done:
+
+	if (have_num_of_vlans) {
+		const struct flow_match *m = &rule->match;
+		struct flow_dissector *d = m->dissector;
+		const struct flow_dissector_key_num_of_vlans *key, *mask;
+
+		key = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
+						m->key);
+		mask = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
+						 m->mask);
+
+		if (mask->num_of_vlans != 0xff) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact num_of_vlans is supported");
+			return 0;
+		}
+
+		num_of_vlans = key->num_of_vlans;
+
+		if (have_cvlan) {
+			if (!have_vlan || num_of_vlans != 2) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "Inner VLAN match requires exact outer VLAN plus exact num_of_vlans 2");
+				return 0;
+			}
+		} else if (have_vlan) {
+			if (num_of_vlans == 2) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "num_of_vlans 2 requires exact inner VLAN keys");
+				return 0;
+			}
+
+			if (num_of_vlans != 1) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "Outer VLAN match supports only exact num_of_vlans 1");
+				return 0;
+			}
+		} else if (num_of_vlans != 0) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Standalone num_of_vlans 1/2 is not exact without VLAN keys");
+			return 0;
+		}
+	}
+
+	if (have_pppoe) {
+		struct flow_match_pppoe match;
+
+		flow_rule_match_pppoe(rule, &match);
+
+		if (!want_n_proto || n_proto != htons(ETH_P_PPP_SES)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "PPPoE match requires exact protocol ppp_ses");
+			return 0;
+		}
+
+		if (match.mask->type != htons(0xffff) ||
+		    match.key->type != htons(ETH_P_PPP_SES)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact PPPoE session ethertype is supported");
+			return 0;
+		}
+
+		if (match.mask->session_id) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "PPPoE session_id match is not supported");
+			return 0;
+		}
+
+		if (match.mask->ppp_proto) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "PPPoE inner PPP protocol match is not supported");
 			return 0;
 		}
 	}
 
 #define entry_prepare() \
-	if (size >= YT921X_ACL_ENT_PER_BLK) \
+	if (size >= YT921X_ACL_ENT_PER_BLK) { \
+		too_complex_entries = size + 1; \
 		goto too_complex; \
+	} \
 	entry = &group[size]; \
 	*entry = (typeof(*entry)){}; \
 	entry->meter_id = YT921X_ACL_METER_ID_INVALID; \
@@ -507,6 +726,272 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 				 ntohs(match.mask->src);
 	}
 
+	if (have_ports_range) {
+		struct flow_match_ports_range match;
+		u16 src_min, src_max, dst_min, dst_max;
+
+		flow_rule_match_ports_range(rule, &match);
+		src_min = ntohs(match.key->tp_min.src);
+		src_max = ntohs(match.key->tp_max.src);
+		dst_min = ntohs(match.key->tp_min.dst);
+		dst_max = ntohs(match.key->tp_max.dst);
+
+		if ((!src_min && src_max) || (!dst_min && dst_max) ||
+		    src_min > src_max || dst_min > dst_max) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Invalid L4 port range");
+			return 0;
+		}
+
+		if (!src_min && !src_max && !dst_min && !dst_max) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "L4 port range requires src_port or dst_port");
+			return 0;
+		}
+
+		entry_prepare();
+		entry->key[0] = (dst_min << 16) | src_min;
+		entry->key[1] = YT921X_ACL_KEYb_TYPE(YT921X_ACL_TYPE_L4);
+		entry->mask[0] = (dst_max << 16) | src_max;
+		if (dst_min != dst_max)
+			entry->key[1] |= YT921X_ACL_KEYb_L4_DPORT_RANGE_EN;
+		if (src_min != src_max)
+			entry->key[1] |= YT921X_ACL_KEYb_L4_SPORT_RANGE_EN;
+	}
+
+	if (have_vlan) {
+		struct flow_match_vlan match;
+		u16 vlan_id_mask, vlan_id;
+		u8 vlan_prio_mask, vlan_prio;
+		__be16 vlan_tpid = 0, vlan_tpid_mask = 0;
+		__be16 vlan_eth_type = 0, vlan_eth_type_mask = 0;
+		u32 tag_fmt;
+		bool is_stag;
+
+		flow_rule_match_vlan(rule, &match);
+		vlan_id_mask = match.mask->vlan_id;
+		vlan_prio_mask = match.mask->vlan_priority;
+		vlan_tpid = match.key->vlan_tpid;
+		vlan_tpid_mask = match.mask->vlan_tpid;
+		vlan_eth_type = match.key->vlan_eth_type;
+		vlan_eth_type_mask = match.mask->vlan_eth_type;
+
+		if (match.mask->vlan_dei) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "vlan_dei match is not supported");
+			return 0;
+		}
+
+		if (vlan_eth_type_mask) {
+			if (!have_cvlan) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "vlan_eth_type match is supported only with inner VLAN keys");
+				return 0;
+			}
+
+			if (vlan_eth_type_mask != htons(0xffff)) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "Only exact vlan_eth_type mask is supported");
+				return 0;
+			}
+
+			if (vlan_eth_type != htons(ETH_P_8021Q) &&
+			    vlan_eth_type != htons(ETH_P_8021AD)) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "Only 802.1Q and 802.1AD inner VLAN ethertypes are supported");
+				return 0;
+			}
+
+			inner_vlan_tpid = vlan_eth_type;
+			inner_vlan_tpid_valid = true;
+		}
+
+		if (vlan_id_mask && vlan_id_mask != VLAN_VID_MASK) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact vlan_id mask is supported");
+			return 0;
+		}
+
+		if (vlan_prio_mask && vlan_prio_mask != 0x7) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact vlan_prio mask is supported");
+			return 0;
+		}
+
+		if (vlan_tpid_mask && vlan_tpid_mask != htons(0xffff)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact vlan_tpid mask is supported");
+			return 0;
+		}
+
+		if (!vlan_id_mask && !vlan_prio_mask) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "FLOW_DISSECTOR_KEY_VLAN requires vlan_id or vlan_prio");
+			return 0;
+		}
+
+		if (!vlan_id_mask && vlan_prio_mask) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "vlan_prio match requires exact vlan_id");
+			return 0;
+		}
+
+		if (!vlan_tpid_mask) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Outer VLAN match requires exact vlan_tpid");
+			return 0;
+		}
+
+		if (vlan_tpid != htons(ETH_P_8021Q) &&
+		    vlan_tpid != htons(ETH_P_8021AD)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only 802.1Q and 802.1AD VLAN TPIDs are supported");
+			return 0;
+		}
+
+		vlan_id = match.key->vlan_id;
+		vlan_prio = match.key->vlan_priority;
+		is_stag = vlan_tpid == htons(ETH_P_8021AD);
+		tag_fmt = vlan_id ? YT921X_ACL_TAG_FMT_TAGGED :
+				    YT921X_ACL_TAG_FMT_PRIO_TAGGED;
+
+		entry_prepare();
+		entry->key[1] = YT921X_ACL_KEYb_TYPE(YT921X_ACL_TYPE_VLAN);
+		if (is_stag) {
+			entry->key[0] = YT921X_ACL_BINa_VLAN_STAG_FMT(tag_fmt) |
+					YT921X_ACL_BINa_VLAN_SVID(vlan_id);
+			entry->mask[0] = YT921X_ACL_BINa_VLAN_STAG_FMT(0x3) |
+					 YT921X_ACL_BINa_VLAN_SVID(vlan_id_mask);
+			if (have_num_of_vlans)
+				entry->mask[0] |= YT921X_ACL_BINa_VLAN_CTAG_FMT(0x3);
+			if (vlan_prio_mask) {
+				entry->key[0] |= YT921X_ACL_BINa_VLAN_SPRI(vlan_prio);
+				entry->mask[0] |= YT921X_ACL_BINa_VLAN_SPRI(vlan_prio_mask);
+			}
+		} else {
+			entry->key[0] = YT921X_ACL_BINa_VLAN_CTAG_FMT(tag_fmt) |
+					YT921X_ACL_BINa_VLAN_CVID(vlan_id);
+			entry->mask[0] = YT921X_ACL_BINa_VLAN_CTAG_FMT(0x3) |
+					 YT921X_ACL_BINa_VLAN_CVID(vlan_id_mask);
+			if (have_num_of_vlans)
+				entry->mask[0] |= YT921X_ACL_BINa_VLAN_STAG_FMT(0x3);
+			if (vlan_prio_mask) {
+				entry->key[1] |= YT921X_ACL_BINb_VLAN_CPRI(vlan_prio);
+				entry->mask[1] |= YT921X_ACL_BINb_VLAN_CPRI(vlan_prio_mask);
+			}
+		}
+	}
+
+	if (have_cvlan) {
+		struct flow_match_vlan match;
+		u16 vlan_id_mask, vlan_id;
+		u8 vlan_prio_mask, vlan_prio;
+		__be16 vlan_tpid = 0, vlan_tpid_mask = 0;
+		bool is_stag;
+
+		if (!have_num_of_vlans) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Inner VLAN match requires exact num_of_vlans 2");
+			return 0;
+		}
+
+		flow_rule_match_cvlan(rule, &match);
+		vlan_id_mask = match.mask->vlan_id;
+		vlan_prio_mask = match.mask->vlan_priority;
+		vlan_tpid = match.key->vlan_tpid;
+		vlan_tpid_mask = match.mask->vlan_tpid;
+
+		if (match.mask->vlan_dei) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "cvlan_dei match is not supported");
+			return 0;
+		}
+
+		if (match.mask->vlan_eth_type) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "cvlan_eth_type match is not supported");
+			return 0;
+		}
+
+		if (vlan_id_mask && vlan_id_mask != VLAN_VID_MASK) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact cvlan_id mask is supported");
+			return 0;
+		}
+
+		if (vlan_prio_mask && vlan_prio_mask != 0x7) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact cvlan_prio mask is supported");
+			return 0;
+		}
+
+		if (vlan_tpid_mask && vlan_tpid_mask != htons(0xffff)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact cvlan_tpid mask is supported");
+			return 0;
+		}
+
+		if (!vlan_id_mask && !vlan_prio_mask) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "FLOW_DISSECTOR_KEY_CVLAN requires cvlan_id or cvlan_prio");
+			return 0;
+		}
+
+		if (!vlan_id_mask && vlan_prio_mask) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "cvlan_prio match requires exact cvlan_id");
+			return 0;
+		}
+
+		if (!vlan_tpid_mask) {
+			/* tc flower may carry the inner tag protocol through the
+			 * outer VLAN key's vlan_eth_type field for double-tagged
+			 * rules. Fall back to 802.1Q only when no such exact
+			 * outer indication exists.
+			 */
+			if (inner_vlan_tpid_valid)
+				vlan_tpid = inner_vlan_tpid;
+			else
+				vlan_tpid = htons(ETH_P_8021Q);
+		} else if (vlan_tpid != htons(ETH_P_8021Q) &&
+			   vlan_tpid != htons(ETH_P_8021AD)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only 802.1Q and 802.1AD inner VLAN TPIDs are supported");
+			return 0;
+		}
+
+		vlan_id = match.key->vlan_id;
+		vlan_prio = match.key->vlan_priority;
+		is_stag = vlan_tpid == htons(ETH_P_8021AD);
+
+		entry_prepare();
+		entry->key[1] = YT921X_ACL_KEYb_TYPE(YT921X_ACL_TYPE_VTAG);
+		if (is_stag) {
+			entry->key[0] = YT921X_ACL_BINa_VTAG_SVID(vlan_id);
+			entry->mask[0] = YT921X_ACL_BINa_VTAG_SVID(vlan_id_mask);
+			if (vlan_prio_mask) {
+				entry->key[0] |= YT921X_ACL_BINa_VTAG_SPRI(vlan_prio);
+				entry->mask[0] |= YT921X_ACL_BINa_VTAG_SPRI(vlan_prio_mask);
+			}
+		} else {
+			entry->key[0] = YT921X_ACL_BINa_VTAG_CVID(vlan_id);
+			entry->mask[0] = YT921X_ACL_BINa_VTAG_CVID(vlan_id_mask);
+			if (vlan_prio_mask) {
+				entry->key[0] |= YT921X_ACL_BINa_VTAG_CPRI(vlan_prio);
+				entry->mask[0] |= YT921X_ACL_BINa_VTAG_CPRI(vlan_prio_mask);
+			}
+		}
+	}
+
+	if (have_num_of_vlans && !have_vlan && !have_cvlan) {
+		entry_prepare();
+		entry->key[0] = YT921X_ACL_BINa_VLAN_CTAG_FMT(YT921X_ACL_TAG_FMT_UNTAGGED) |
+				YT921X_ACL_BINa_VLAN_STAG_FMT(YT921X_ACL_TAG_FMT_UNTAGGED);
+		entry->key[1] = YT921X_ACL_KEYb_TYPE(YT921X_ACL_TYPE_VLAN);
+		entry->mask[0] = YT921X_ACL_BINa_VLAN_CTAG_FMT(0x3) |
+				 YT921X_ACL_BINa_VLAN_STAG_FMT(0x3);
+	}
+
 	if (have_ip) {
 		struct flow_match_ip match;
 		bool want_tos;
@@ -583,6 +1068,16 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 		}
 	}
 
+	if (have_pppoe) {
+		entry = yt921x_acl_find_misc(group, size);
+		if (!entry) {
+			entry_prepare();
+			entry->key[1] = YT921X_ACL_KEYb_TYPE(YT921X_ACL_TYPE_MISC);
+		}
+
+		yt921x_acl_entry_set(entry, 0, YT921X_ACL_BINa_MISC_PPPOE_FLAG);
+	}
+
 	if (have_eth) {
 		struct flow_match_eth_addrs match;
 		bool want_dst;
@@ -621,23 +1116,22 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 
 	if (have_ctrl) {
 		u32 supp_flags = FLOW_DIS_IS_FRAGMENT | FLOW_DIS_FIRST_FRAG;
-		struct flow_match_control match;
+		struct flow_match_control *match = &ctrl_match;
 
-		flow_rule_match_control(rule, &match);
 		if (!flow_rule_is_supp_control_flags(supp_flags,
-						     match.mask->flags, extack))
+						     match->mask->flags, extack))
 			return 0;
 
-		if (match.mask->flags & FLOW_DIS_FIRST_FRAG)
+		if (match->mask->flags & FLOW_DIS_FIRST_FRAG)
 			size = yt921x_acl_append_first_frag(group, size);
-		else if (match.mask->flags & FLOW_DIS_IS_FRAGMENT)
+		else if (match->mask->flags & FLOW_DIS_IS_FRAGMENT)
 			size = yt921x_acl_append_frag(group, size);
 
 		if (!size)
 			goto too_complex;
 	}
 
-	if (have_tcp) {
+	if (want_tcp_flags) {
 		struct flow_match_tcp match;
 
 		entry = yt921x_acl_find_misc(group, size);
@@ -681,7 +1175,9 @@ yt921x_acl_parse_key(struct yt921x_priv *priv,
 	return size;
 
 too_complex:
-	NL_SET_ERR_MSG_MOD(extack, "Rule too complex");
+	NL_SET_ERR_MSG_FMT(extack,
+			   "Rule too complex: requires %u ACL entries, max %u per block",
+			   too_complex_entries ?: size, YT921X_ACL_ENT_PER_BLK);
 	return 0;
 }
 
@@ -803,11 +1299,13 @@ yt921x_acl_parse_mangle_dscp(const struct flow_rule *rule,
 
 static int
 yt921x_acl_parse_action(struct yt921x_acl_entry *group,
+			struct yt921x_priv *priv,
 			struct dsa_switch *ds,
 			struct flow_cls_offload *cls)
 {
 	const struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	struct netlink_ext_ack *extack = cls->common.extack;
+	const struct flow_match *match = &rule->match;
 	const struct flow_action_entry *act;
 	struct dsa_port *to_dp;
 	bool mirror_seen = false;
@@ -817,10 +1315,35 @@ yt921x_acl_parse_action(struct yt921x_acl_entry *group,
 	bool dscp_ipv4_seen = false;
 	bool dscp_ipv6_seen = false;
 	bool csum_seen = false;
+	bool vlan_act_seen = false;
+	bool have_vlan = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN);
+	bool have_cvlan = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN);
+	bool have_num_of_vlans = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_NUM_OF_VLANS);
+	u8 num_of_vlans = 0;
 	u32 *action = group[0].action;
 	int i;
 
+	if (have_num_of_vlans) {
+		struct flow_dissector *d = match->dissector;
+		const struct flow_dissector_key_num_of_vlans *key, *mask;
+
+		key = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
+						match->key);
+		mask = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
+						 match->mask);
+		if (mask->num_of_vlans != 0xff) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Only exact num_of_vlans is supported");
+			return -EOPNOTSUPP;
+		}
+
+		num_of_vlans = key->num_of_vlans;
+	}
+
 	memset(action, 0, sizeof(group[0].action));
+	group[0].meter_id = YT921X_ACL_METER_ID_INVALID;
+	group[0].flow_stats_id = YT921X_ACL_FLOW_STATS_ID_INVALID;
+	group[0].flow_stats_last = 0;
 	group[0].mirror_en = false;
 	group[0].mirror_to_port = 0;
 	flow_action_for_each(i, act, &rule->action) {
@@ -835,11 +1358,6 @@ yt921x_acl_parse_action(struct yt921x_acl_entry *group,
 			group[0].meter_id = YT921X_ACL_METER_ID_BLACKHOLE;
 			break;
 		case FLOW_ACTION_TRAP:
-			if (group[0].mirror_en) {
-				NL_SET_ERR_MSG_MOD(extack,
-						   "Trap cannot be combined with mirror");
-				return -EOPNOTSUPP;
-			}
 			if (police_seen) {
 				NL_SET_ERR_MSG_MOD(extack,
 						   "Trap cannot be combined with police");
@@ -870,11 +1388,6 @@ yt921x_acl_parse_action(struct yt921x_acl_entry *group,
 #ifdef FLOW_ACTION_REDIRECT_INGRESS
 		case FLOW_ACTION_REDIRECT_INGRESS:
 #endif
-			if (group[0].mirror_en) {
-				NL_SET_ERR_MSG_MOD(extack,
-						   "Redirect cannot be combined with mirror");
-				return -EOPNOTSUPP;
-			}
 			if ((action[2] & YT921X_ACL_ACTc_REDIR_EN) &&
 			    (action[2] & YT921X_ACL_ACTc_REDIR_M) !=
 				    YT921X_ACL_ACTc_REDIR_STEER) {
@@ -919,11 +1432,6 @@ yt921x_acl_parse_action(struct yt921x_acl_entry *group,
 						   "Only user ports can be mirror destination");
 				return -EOPNOTSUPP;
 			}
-			if (action[2] & YT921X_ACL_ACTc_REDIR_EN) {
-				NL_SET_ERR_MSG_MOD(extack,
-						   "Mirror cannot be combined with redirect/trap");
-				return -EOPNOTSUPP;
-			}
 			if (mirror_seen && group[0].mirror_to_port != to_dp->index) {
 				NL_SET_ERR_MSG_MOD(extack,
 						   "Multiple mirror destinations are not supported");
@@ -945,11 +1453,6 @@ yt921x_acl_parse_action(struct yt921x_acl_entry *group,
 			action[1] |= YT921X_ACL_ACTb_PRIO(act->priority);
 			break;
 		case FLOW_ACTION_POLICE:
-#if !IS_ENABLED(CONFIG_NET_DSA_YT921X_DEBUG)
-			NL_SET_ERR_MSG_MOD(extack,
-					   "Ingress policing offload is disabled in non-debug builds");
-			return -EOPNOTSUPP;
-#else
 			if (trap_seen ||
 			    ((action[2] & YT921X_ACL_ACTc_REDIR_EN) &&
 			     (action[2] & YT921X_ACL_ACTc_REDIR_M) ==
@@ -973,7 +1476,6 @@ yt921x_acl_parse_action(struct yt921x_acl_entry *group,
 			action[0] |= YT921X_ACL_ACTa_METER_EN;
 			police_seen = true;
 			break;
-#endif
 		case FLOW_ACTION_MANGLE: {
 			u8 dscp;
 			bool is_ipv4;
@@ -999,6 +1501,143 @@ yt921x_acl_parse_action(struct yt921x_acl_entry *group,
 			else
 				dscp_ipv6_seen = true;
 			dscp_seen = true;
+			break;
+		}
+		case FLOW_ACTION_VLAN_POP: {
+			struct flow_match_vlan match;
+			bool is_stag;
+
+			if (vlan_act_seen) {
+				NL_SET_ERR_MSG_MOD(extack, "Multiple VLAN actions are not supported");
+				return -EOPNOTSUPP;
+			}
+			vlan_act_seen = true;
+
+			if (!have_vlan || have_cvlan || !have_num_of_vlans ||
+			    num_of_vlans != 1) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "VLAN pop requires exact single outer VLAN match");
+				return -EOPNOTSUPP;
+			}
+
+			flow_rule_match_vlan(rule, &match);
+			is_stag = match.key->vlan_tpid == htons(ETH_P_8021AD);
+
+			if (is_stag) {
+				action[2] &= ~YT921X_ACL_ACTc_STAG_M;
+				action[2] |= YT921X_ACL_ACTc_STAG_UNTAG;
+			} else {
+				action[2] &= ~YT921X_ACL_ACTc_CTAG_M;
+				action[2] |= YT921X_ACL_ACTc_CTAG_UNTAG;
+			}
+			break;
+		}
+		case FLOW_ACTION_VLAN_PUSH: {
+			u16 vid = act->vlan.vid;
+			u8 prio = act->vlan.prio;
+
+			if (vlan_act_seen) {
+				NL_SET_ERR_MSG_MOD(extack, "Multiple VLAN actions are not supported");
+				return -EOPNOTSUPP;
+			}
+			vlan_act_seen = true;
+
+			if (have_vlan || have_cvlan || !have_num_of_vlans ||
+			    num_of_vlans != 0) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "VLAN push requires exact num_of_vlans 0");
+				return -EOPNOTSUPP;
+			}
+
+			if (act->vlan.proto != htons(ETH_P_8021Q) &&
+			    act->vlan.proto != htons(ETH_P_8021AD)) {
+				NL_SET_ERR_MSG_MOD(extack, "Unsupported VLAN protocol for push action");
+				return -EOPNOTSUPP;
+			}
+
+			if (act->vlan.proto == htons(ETH_P_8021AD)) {
+				action[2] &= ~YT921X_ACL_ACTc_STAG_M;
+				action[2] |= YT921X_ACL_ACTc_STAG_TAG;
+
+				action[1] |= YT921X_ACL_ACTb_SVID_REPLACE;
+				action[1] &= ~((u32)0x1ff << 23);
+				action[1] |= (vid & 0x1ff) << 23;
+				action[2] &= ~0x7;
+				action[2] |= (vid >> 9) & 0x7;
+
+				action[2] |= YT921X_ACL_ACTc_SPRI_REPLACE;
+				action[2] &= ~YT921X_ACL_ACTc_SPRI_M;
+				action[2] |= FIELD_PREP(YT921X_ACL_ACTc_SPRI_M, prio);
+			} else {
+				action[2] &= ~YT921X_ACL_ACTc_CTAG_M;
+				action[2] |= YT921X_ACL_ACTc_CTAG_TAG;
+
+				action[1] |= YT921X_ACL_ACTb_CVID_REPLACE;
+				action[1] &= ~YT921X_ACL_ACTb_CVID_M;
+				action[1] |= FIELD_PREP(YT921X_ACL_ACTb_CVID_M, vid);
+
+				action[1] |= YT921X_ACL_ACTb_CPRI_REPLACE;
+				action[1] &= ~YT921X_ACL_ACTb_CPRI_M;
+				action[1] |= FIELD_PREP(YT921X_ACL_ACTb_CPRI_M, prio);
+			}
+			break;
+		}
+		case FLOW_ACTION_VLAN_MANGLE: {
+			u16 vid = act->vlan.vid;
+			u8 prio = act->vlan.prio;
+			struct flow_match_vlan match;
+			bool match_is_stag, is_stag;
+
+			if (vlan_act_seen) {
+				NL_SET_ERR_MSG_MOD(extack, "Multiple VLAN actions are not supported");
+				return -EOPNOTSUPP;
+			}
+			vlan_act_seen = true;
+
+			if (!have_vlan || have_cvlan || !have_num_of_vlans ||
+			    num_of_vlans != 1) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "VLAN modify requires exact single outer VLAN match");
+				return -EOPNOTSUPP;
+			}
+
+			flow_rule_match_vlan(rule, &match);
+			match_is_stag = match.key->vlan_tpid == htons(ETH_P_8021AD);
+			is_stag = match_is_stag;
+
+			if (act->vlan.proto) {
+				if (act->vlan.proto != htons(ETH_P_8021Q) &&
+				    act->vlan.proto != htons(ETH_P_8021AD)) {
+					NL_SET_ERR_MSG_MOD(extack, "Unsupported VLAN protocol for mangle action");
+					return -EOPNOTSUPP;
+				}
+
+				if ((act->vlan.proto == htons(ETH_P_8021AD)) != match_is_stag) {
+					NL_SET_ERR_MSG_MOD(extack,
+							   "VLAN modify protocol must match the outer VLAN TPID");
+					return -EOPNOTSUPP;
+				}
+			}
+
+			if (is_stag) {
+				action[1] |= YT921X_ACL_ACTb_SVID_REPLACE;
+				action[1] &= ~((u32)0x1ff << 23);
+				action[1] |= (vid & 0x1ff) << 23;
+				action[2] &= ~0x7;
+				action[2] |= (vid >> 9) & 0x7;
+
+				action[2] |= YT921X_ACL_ACTc_SPRI_REPLACE;
+				action[2] &= ~YT921X_ACL_ACTc_SPRI_M;
+				action[2] |= FIELD_PREP(YT921X_ACL_ACTc_SPRI_M, prio);
+			} else {
+				action[1] |= YT921X_ACL_ACTb_CVID_REPLACE;
+				action[1] &= ~YT921X_ACL_ACTb_CVID_M;
+				action[1] |= FIELD_PREP(YT921X_ACL_ACTb_CVID_M, vid);
+
+				action[1] |= YT921X_ACL_ACTb_CPRI_REPLACE;
+				action[1] &= ~YT921X_ACL_ACTb_CPRI_M;
+				action[1] |= FIELD_PREP(YT921X_ACL_ACTb_CPRI_M, prio);
+			}
 			break;
 		}
 		case FLOW_ACTION_CSUM:
@@ -1059,7 +1698,7 @@ yt921x_acl_parse(struct yt921x_acl_entry *group, u16 ports_mask,
 		return 0;
 	}
 
-	res = yt921x_acl_parse_action(group, ds, cls);
+	res = yt921x_acl_parse_action(group, priv, ds, cls);
 	if (res) {
 		YT921X_RECORD_ERR(priv, acl_parse_errors,
 				  YT921X_TELEM_STAGE_ACL_PARSE, res,
@@ -1147,6 +1786,13 @@ yt921x_acl_commit(struct yt921x_priv *priv, unsigned int blkid, u8 ents_mask,
 	for_each_set_bit(i, &mask, YT921X_ACL_ENT_PER_BLK) {
 		unsigned int e = i + YT921X_ACL_ENT_PER_BLK * blkid;
 
+		if (entries[i].action[0] & YT921X_ACL_ACTa_FLOW_STATS_EN)
+			pr_info("yt921x acl commit blk=%u ent=%lu reg=0x%x act=%08x/%08x/%08x cookie=%lx flow_id=%u\n",
+				blkid, i, YT921X_ACLn_ACT(e),
+				entries[i].action[0], entries[i].action[1],
+				entries[i].action[2], entries[i].cookie,
+				entries[i].flow_stats_id);
+
 		res = yt921x_reg96_write(priv, YT921X_ACLn_ACT(e),
 					 entries[i].action);
 		if (res) {
@@ -1192,6 +1838,7 @@ yt921x_acl_del(struct yt921x_priv *priv, unsigned long cookie,
 {
 	struct yt921x_acl_entry backup[YT921X_ACL_ENT_PER_BLK] = {};
 	struct yt921x_acl_entry *entries;
+	u8 flow_stats_id;
 	unsigned int offset;
 	unsigned int blkid;
 	unsigned int entid;
@@ -1210,6 +1857,7 @@ yt921x_acl_del(struct yt921x_priv *priv, unsigned long cookie,
 	if (entries[offset].type == U32_MAX)
 		offset = entries[offset].start;
 	meter_id = entries[offset].meter_id;
+	flow_stats_id = entries[offset].flow_stats_id;
 	meter_en = !!(entries[offset].action[0] & YT921X_ACL_ACTa_METER_EN);
 	if (mirror_enp)
 		*mirror_enp = entries[offset].mirror_en;
@@ -1265,6 +1913,19 @@ yt921x_acl_del(struct yt921x_priv *priv, unsigned long cookie,
 			YT921X_RECORD_ERR(priv, acl_commit_errors,
 					  YT921X_TELEM_STAGE_ACL_COMMIT,
 					  clear_res, -1, meter_id, 0, cookie);
+	}
+
+	if ((backup[offset].action[0] & YT921X_ACL_ACTa_FLOW_STATS_EN) &&
+	    flow_stats_id != YT921X_ACL_FLOW_STATS_ID_INVALID) {
+		int clear_res = yt921x_acl_flow_stats_clear_hw(priv, flow_stats_id);
+
+		yt921x_acl_flow_stats_free(priv, flow_stats_id);
+		if (clear_res)
+			YT921X_RECORD_ERR(priv, acl_commit_errors,
+					  YT921X_TELEM_STAGE_ACL_COMMIT,
+					  clear_res, -1,
+					  YT921X_FLOWSTATn_CTRL(flow_stats_id),
+					  flow_stats_id, cookie);
 	}
 
 	return 0;
@@ -1371,19 +2032,46 @@ yt921x_acl_add(struct yt921x_priv *priv, const struct yt921x_acl_entry *group,
 			break;
 	}
 
+	if ((group[0].action[0] & YT921X_ACL_ACTa_FLOW_STATS_EN) &&
+	    group[0].flow_stats_id != YT921X_ACL_FLOW_STATS_ID_INVALID) {
+		u8 flow_stats_id = group[0].flow_stats_id;
+		u32 ctrl = YT921X_FLOWSTAT_CTRL_EN |
+			   YT921X_FLOWSTAT_CTRL_TYPE_FLOW;
+
+		if (yt921x_flow_stats_pkt_mode())
+			ctrl |= YT921X_FLOWSTAT_CTRL_PKT_MODE;
+
+		res = yt921x_reg_write(priv, YT921X_FLOWSTATn_CTRL(flow_stats_id),
+				       ctrl);
+		if (res)
+			goto err_flow_stats;
+
+		res = yt921x_reg64_write(priv, YT921X_FLOWSTATn_STAT(flow_stats_id),
+					 0);
+		if (res)
+			goto err_flow_stats;
+	}
+
 	priv->acl.useds[blkid] += size;
 	WARN_ON(priv->acl.useds[blkid] > YT921X_ACL_ENT_PER_BLK);
 
 	res = yt921x_acl_commit(priv, blkid, ents_mask, BIT(offset));
-	if (res) {
-		unsigned long mask = ents_mask;
-		unsigned long i;
+	if (res)
+		goto err_flow_stats;
 
-		for_each_set_bit(i, &mask, YT921X_ACL_ENT_PER_BLK)
-			entries[i] = (typeof(*entries)){};
+	if ((group[0].action[0] & YT921X_ACL_ACTa_FLOW_STATS_EN) &&
+	    group[0].flow_stats_id != YT921X_ACL_FLOW_STATS_ID_INVALID) {
+		unsigned int entid = offset + YT921X_ACL_ENT_PER_BLK * blkid;
 
-		priv->acl.useds[blkid] -= hweight8(ents_mask);
-		return res;
+		/* FLOW_STATS_EN does not appear to latch reliably when ACT is
+		 * written during ACL_BLK_CMD_MODIFY. Re-apply action word 0
+		 * after the block commit finishes and the flowstat slot is
+		 * already enabled.
+		 */
+		res = yt921x_reg_write(priv, YT921X_ACLn_ACT(entid),
+				       entries[offset].action[0]);
+		if (res)
+			goto err_flow_stats;
 	}
 
 	for (unsigned int i = 0; i < udfs_cnt; i++) {
@@ -1395,6 +2083,21 @@ yt921x_acl_add(struct yt921x_priv *priv, const struct yt921x_acl_entry *group,
 	}
 
 	return 0;
+
+err_flow_stats:
+	for (unsigned int i = 0; i < YT921X_ACL_ENT_PER_BLK; i++) {
+		if (!(ents_mask & BIT(i)))
+			continue;
+		entries[i] = (typeof(*entries)){};
+	}
+	if (priv->acl.useds[blkid] >= hweight8(ents_mask))
+		priv->acl.useds[blkid] -= hweight8(ents_mask);
+	yt921x_acl_commit(priv, blkid, ents_mask, BIT(offset));
+	if (group[0].flow_stats_id != YT921X_ACL_FLOW_STATS_ID_INVALID) {
+		yt921x_acl_flow_stats_clear_hw(priv, group[0].flow_stats_id);
+		yt921x_acl_flow_stats_free(priv, group[0].flow_stats_id);
+	}
+	return res;
 }
 
 static int yt921x_acl_mirror_get(struct yt921x_priv *priv, int to_local_port,
@@ -1405,10 +2108,57 @@ int
 yt921x_dsa_cls_flower_stats(struct dsa_switch *ds, int port,
 			    struct flow_cls_offload *cls, bool ingress)
 {
+	struct yt921x_priv *priv = yt921x_to_priv(ds);
+	struct yt921x_acl_entry *entry;
+	unsigned long lastused = 0;
+	u64 counter;
+	u64 delta;
+	int entid;
+	int res;
+
 	if (!cls->cookie)
 		return -EINVAL;
+	if (!dsa_is_user_port(ds, port))
+		return -EOPNOTSUPP;
 
-	return -EOPNOTSUPP;
+	mutex_lock(&priv->reg_lock);
+	entid = yt921x_acl_find(priv, cls->cookie);
+	if (entid == UINT_MAX) {
+		res = -ENOENT;
+		goto out_unlock;
+	}
+
+	entry = &priv->acl.entries[entid];
+	if (entry->type == U32_MAX)
+		entry = &priv->acl.entries[entry->start];
+	if (!(entry->action[0] & YT921X_ACL_ACTa_FLOW_STATS_EN) ||
+	    entry->flow_stats_id == YT921X_ACL_FLOW_STATS_ID_INVALID) {
+		res = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	res = yt921x_reg64_read(priv, YT921X_FLOWSTATn_STAT(entry->flow_stats_id),
+				&counter);
+	if (res)
+		goto out_unlock;
+
+	delta = counter >= entry->flow_stats_last ?
+		counter - entry->flow_stats_last : counter;
+	entry->flow_stats_last = counter;
+	if (yt921x_flow_stats_pkt_mode())
+		flow_stats_update(&cls->stats, 0, delta, 0, lastused,
+				  FLOW_ACTION_HW_STATS_IMMEDIATE);
+	else
+		flow_stats_update(&cls->stats, delta, 0, 0, lastused,
+				  FLOW_ACTION_HW_STATS_IMMEDIATE);
+	res = 0;
+
+out_unlock:
+	mutex_unlock(&priv->reg_lock);
+	if (!res)
+		cls->stats.used_hw_stats = FLOW_ACTION_HW_STATS_IMMEDIATE;
+
+	return res;
 }
 
 int
@@ -1443,6 +2193,7 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 	const struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	const struct flow_action_entry *act;
 	struct yt921x_priv *priv = yt921x_to_priv(ds);
+	u32 flow_stats_id = YT921X_ACL_FLOW_STATS_ID_INVALID;
 	unsigned int udfs_cnt = 0;
 	u32 meter_id = YT921X_ACL_METER_ID_INVALID;
 	bool mirror_prepared = false;
@@ -1473,6 +2224,23 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 		goto out_unlock;
 	}
 
+	res = yt921x_acl_flow_stats_alloc(priv, &flow_stats_id);
+	if (res) {
+		NL_SET_ERR_MSG_MOD(cls->common.extack,
+				   "No ACL flow stats slot available");
+		goto out_unlock;
+	}
+
+	group[0].flow_stats_id = flow_stats_id;
+	group[0].flow_stats_last = 0;
+	group[0].action[0] |= YT921X_ACL_ACTa_FLOW_STATS_EN;
+	group[0].action[0] &= ~YT921X_ACL_ACTa_FLOW_STATS_PTR;
+	group[0].action[0] |= FIELD_PREP(YT921X_ACL_ACTa_FLOW_STATS_PTR,
+					 group[0].flow_stats_id);
+	pr_info("yt921x acl add cookie=%lx act=%08x/%08x/%08x flow_id=%u\n",
+		cls->cookie, group[0].action[0], group[0].action[1],
+		group[0].action[2], group[0].flow_stats_id);
+
 	flow_action_for_each(i, act, &rule->action) {
 		if (act->id != FLOW_ACTION_POLICE)
 			continue;
@@ -1481,7 +2249,7 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 			NL_SET_ERR_MSG_MOD(cls->common.extack,
 					   "Multiple police actions are not supported");
 			res = -EOPNOTSUPP;
-			goto out_unlock;
+			goto out_cleanup;
 		}
 
 		res = yt921x_acl_meter_alloc(priv, &meter_id);
@@ -1489,7 +2257,7 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 			NL_SET_ERR_MSG_MOD(cls->common.extack,
 					   "No ACL meter profile available");
 			res = -ENOSPC;
-			goto out_unlock;
+			goto out_cleanup;
 		}
 
 		res = yt921x_acl_meter_apply(priv, port, meter_id,
@@ -1497,7 +2265,7 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 		if (res) {
 			yt921x_acl_meter_free(priv, meter_id);
 			meter_id = YT921X_ACL_METER_ID_INVALID;
-			goto out_unlock;
+			goto out_cleanup;
 		}
 
 		group[0].action[0] &= ~YT921X_ACL_ACTa_METER_ID_M;
@@ -1510,13 +2278,8 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 	if (group[0].mirror_en) {
 		res = yt921x_acl_mirror_get(priv, group[0].mirror_to_port,
 					    cls->common.extack);
-		if (res) {
-			if (meter_id != YT921X_ACL_METER_ID_INVALID) {
-				yt921x_acl_meter_clear_hw(priv, meter_id);
-				yt921x_acl_meter_free(priv, meter_id);
-			}
-			goto out_unlock;
-		}
+		if (res)
+			goto out_cleanup;
 
 		mirror_prepared = true;
 	}
@@ -1526,6 +2289,25 @@ yt921x_dsa_cls_flower_add(struct dsa_switch *ds, int port,
 	if (res && meter_id != YT921X_ACL_METER_ID_INVALID) {
 		yt921x_acl_meter_clear_hw(priv, meter_id);
 		yt921x_acl_meter_free(priv, meter_id);
+		meter_id = YT921X_ACL_METER_ID_INVALID;
+	}
+	if (res && flow_stats_id != YT921X_ACL_FLOW_STATS_ID_INVALID) {
+		yt921x_acl_flow_stats_clear_hw(priv, flow_stats_id);
+		yt921x_acl_flow_stats_free(priv, flow_stats_id);
+		flow_stats_id = YT921X_ACL_FLOW_STATS_ID_INVALID;
+	}
+	if (res && mirror_prepared)
+		yt921x_acl_mirror_put(priv, group[0].mirror_to_port);
+	goto out_unlock;
+
+out_cleanup:
+	if (res && meter_id != YT921X_ACL_METER_ID_INVALID) {
+		yt921x_acl_meter_clear_hw(priv, meter_id);
+		yt921x_acl_meter_free(priv, meter_id);
+	}
+	if (res && flow_stats_id != YT921X_ACL_FLOW_STATS_ID_INVALID) {
+		yt921x_acl_flow_stats_clear_hw(priv, flow_stats_id);
+		yt921x_acl_flow_stats_free(priv, flow_stats_id);
 	}
 	if (res && mirror_prepared)
 		yt921x_acl_mirror_put(priv, group[0].mirror_to_port);
