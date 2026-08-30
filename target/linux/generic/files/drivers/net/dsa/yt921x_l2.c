@@ -1153,7 +1153,6 @@ int yt921x_secondary_cpu_isolation_sync(struct yt921x_priv *priv,
 	struct dsa_switch *ds = &priv->ds;
 	struct dsa_port *dp;
 	u32 blocked_mask;
-	u32 allowed_mask;
 	int upstream_port;
 
 	if (!dsa_is_cpu_port(ds, cpu_port) ||
@@ -1162,6 +1161,8 @@ int yt921x_secondary_cpu_isolation_sync(struct yt921x_priv *priv,
 
 #if IS_ENABLED(CONFIG_NET_DSA_YT921X_CR881X)
 	if (priv->dt_secondary_conduit_user_mask_valid) {
+		u32 allowed_mask;
+
 		allowed_mask = priv->dt_secondary_conduit_user_mask &
 			       yt921x_non_cpu_port_mask(priv);
 		blocked_mask = yt921x_non_cpu_port_mask(priv) & ~allowed_mask;

@@ -956,8 +956,6 @@ static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 	unsigned long cpu_ports_mask;
 	u64 ctrl64;
 	u32 ctrl;
-	u32 allowed_mask;
-	u32 blocked_mask;
 	int port;
 	int dt_primary_cpu_port = -1;
 	int dt_secondary_cpu_port = -1;
@@ -1041,6 +1039,9 @@ static int yt921x_chip_setup_dsa(struct yt921x_priv *priv)
 	if (of_machine_is_compatible("xiaomi,cr881x") &&
 	    priv->secondary_cpu_port >= 0 &&
 	    priv->dt_secondary_conduit_user_mask_valid) {
+		u32 allowed_mask;
+		u32 blocked_mask;
+
 		allowed_mask = priv->dt_secondary_conduit_user_mask &
 			       yt921x_non_cpu_port_mask(priv);
 		blocked_mask = yt921x_non_cpu_port_mask(priv) & ~allowed_mask;
